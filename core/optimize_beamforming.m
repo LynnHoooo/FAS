@@ -256,13 +256,7 @@ function [W_recon, R_recon] = rank_one_reconstruction(W_in, R_in, h_mkn, alpha, 
             end
         end
     end
-
-
-function rate = compute_sum_rate(h_mkn_precomputed, W, R, alpha, sigma2, M, K, N)
-    % 使用标准和速率计算函数
-    rate = compute_sum_rate_standard(h_mkn_precomputed, W, R, alpha, sigma2, M, K, N);
 end
-
 
 function stats = compute_power_statistics(W_cells, R_cells, Pmax, M, K, N)
     max_usage = 0;

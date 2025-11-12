@@ -206,20 +206,28 @@ end
 eta = zeros(M, N);
 for m = 1:M
     for n = 1:N
-        users_served = find(alpha_init(m,:,n));
-        if ~isempty(users_served)
-            % 修改：大幅降低感知功率占比，优先提升通信速率
-            % 将eta从0.70-0.80降低到0.10-0.30
-            avg_dist = mean(arrayfun(@(k) norm(squeeze(q_traj(k,:,n)) - u(m,:)), users_served));
-            if avg_dist < 150
-                eta(m,n) = 0.10; % 感知占10%，通信占90%
-            elseif avg_dist < 250
-                eta(m,n) = 0.20; % 感知占20%，通信占80%
-            else
-                eta(m,n) = 0.30; % 感知占30%，通信占70%
+        % 感知负担：更近的感知点权重更大，且考虑其他GBS覆盖能力
+        sensing_burden = 0;
+        for q_idx = 1:Q
+            dist_factor = 1 / (d_lq(m, q_idx)^2 + 1e-6);
+            coverage_by_others = 0;
+            for m2 = 1:M
+                if m2 ~= m
+                    coverage_by_others = coverage_by_others + 1 / (d_lq(m2, q_idx)^2 + 1e-6);
+                end
             end
+            sensing_burden = sensing_burden + dist_factor / (1 + 0.1*coverage_by_others);
+        end
+
+        % 通信负担：服务用户数
+        comm_users = sum(alpha_init(m,:,n));
+
+        % 动态功率分配：在[0.3, 0.7]范围内自适应
+        if comm_users == 0
+            eta(m,n) = 0.8; % 不服务UAV时倾向于用于感知
         else
-            eta(m,n) = 0.50; % 如果不服务任何UAV，感知占50%
+            ratio = sensing_burden / (sensing_burden + 10*comm_users);
+            eta(m,n) = max(0.3, min(0.7, ratio));
         end
     end
 end
@@ -257,22 +265,53 @@ end
 % === 第三步：初始化感知信号 R_m[n] (优化波束成形 + 动态功率) ===
 for m = 1:M
     for n = 1:N
-        % 策略：对所有感知点导向矢量做加权平均，形成“广义主瓣”
-        a_combined = zeros(Na, 1);
-        weights = zeros(Q, 1);
+        % 多目标权重：距离、他站覆盖、阵列增益
+        imp = zeros(Q,1);
         for q_idx = 1:Q
-            % 权重为距离倒数平方，更强调近处目标
-            weights(q_idx) = 1 / (d_lq(m, q_idx)^2 + 1e-6);
-            a_combined = a_combined + weights(q_idx) * a_theta{m, q_idx};
+            dist_w = 1 / (d_lq(m, q_idx)^2 + 1e-6);
+            cover_others = 0;
+            for m2 = 1:M
+                if m2 ~= m
+                    cover_others = cover_others + 1 / (d_lq(m2, q_idx)^2 + 1e-6);
+                end
+            end
+            cover_w = 1 / (1 + 0.5*cover_others);
+            a_vec = a_theta{m, q_idx};
+            arr_gain = real(a_vec' * a_vec);
+            geo_w = sqrt(max(arr_gain,0));
+            imp(q_idx) = dist_w * cover_w * geo_w;
         end
-        
-        if norm(a_combined) > 1e-6
-            a_combined = a_combined / norm(a_combined); % 归一化
+        s = sum(imp);
+        if s > 0
+            imp = imp / s;
         else
-            % 如果所有感知点都很远，使用默认的全向
-            a_combined = ones(Na, 1) / sqrt(Na);
+            imp = ones(Q,1)/Q;
         end
-        
+
+        % 合成波束（启发式加权）并尝试主特征向量优化
+        a_combined = zeros(Na,1);
+        for q_idx = 1:Q
+            a_combined = a_combined + imp(q_idx) * a_theta{m, q_idx};
+        end
+        if norm(a_combined) <= 1e-6
+            a_combined = ones(Na,1)/sqrt(Na);
+        else
+            a_combined = a_combined / norm(a_combined);
+        end
+
+        % 构造加权目标矩阵，取主特征向量进一步强化主瓣
+        A_w = zeros(Na,Na);
+        for q_idx = 1:Q
+            a_vec = a_theta{m, q_idx};
+            A_w = A_w + imp(q_idx) * (a_vec * a_vec');
+        end
+        [V,D] = eig(A_w);
+        [~,ix] = max(real(diag(D)));
+        w_opt = V(:,ix);
+        if norm(w_opt) > 1e-6
+            a_combined = w_opt / norm(w_opt);
+        end
+
         % 使用动态分配的感知功率
         power_sensing = Pmax * eta(m,n);
         R_init{m,1,n} = power_sensing * (a_combined * a_combined');

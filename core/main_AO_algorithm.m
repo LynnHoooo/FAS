@@ -132,7 +132,8 @@ for iter = 1:max_iterations
     % 子问题2: 优化波束成形（使用当前解作为初始点）
     fprintf('  步骤2: 波束优化...\n');
     try
-        % 使用W_current和R_current作为初始点，保持迭代连续性
+        % 注意：optimize_beamforming接受单个位置向量，使用GBS1的位置作为代表
+        % 这是为了与原始系统保持兼容性的临时方案
         [W_new, R_new, ~] = optimize_beamforming(...
             h_mkn, alpha_new, R_current, W_current, ...
             Pmax, Gamma, sigma2, M, K, N, Na, Q, v, u, H_sense, kappa, t_current{1});
@@ -501,10 +502,6 @@ function min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v
     min_sensing_power = min(zeta_qn(:));
 end
 
-function rate = compute_sum_rate(h_mkn_precomputed, W, R, alpha, sigma2, M, K, N)
-    % 使用标准和速率计算函数
-    rate = compute_sum_rate_standard(h_mkn_precomputed, W, R, alpha, sigma2, M, K, N);
-end
 
 function [q_updated, h_updated] = position_search_2d(q_current, h_current, W_mkn, R_mn, alpha_mkn, ...
     u, H, sigma2, kappa, d, Na, search_cfg, M, K, N)
@@ -582,3 +579,40 @@ function [q_updated, h_updated] = position_search_2d(q_current, h_current, W_mkn
         fprintf('  UAV%d: 最优位置 (%.1f m, %.1f m)，加权速率评分 %.4f\n', k, best_pos(1), best_pos(2), best_score);
     end
 end
+
+%% 缺失的辅助函数
+function rate = compute_sum_rate(h_mkn_precomputed, W_mkn, R_mkn, alpha_mkn, sigma2, M, K, N)
+% 计算系统总和速率
+    rate = 0;
+    for n = 1:N
+        for k = 1:K
+            m_serv = find(alpha_mkn(:,k,n) == 1, 1);
+            if isempty(m_serv)
+                continue;
+            end
+            
+            h_mk = h_mkn_precomputed{m_serv,k,n};
+            signal_power = real(h_mk' * W_mkn{m_serv,k,n} * h_mk);
+            
+            interference = 0;
+            % 来自其他GBS和用户的干扰
+            for l = 1:M
+                for i = 1:K
+                    if ~(l==m_serv && i==k) && alpha_mkn(l,i,n) == 1
+                        h_lk = h_mkn_precomputed{l,k,n};
+                        interference = interference + real(h_lk' * W_mkn{l,i,n} * h_lk);
+                    end
+                end
+                % 感知信号干扰
+                if ~isempty(R_mkn) && ~isempty(R_mkn{l,1,n})
+                    h_lk = h_mkn_precomputed{l,k,n};
+                    interference = interference + real(h_lk' * R_mkn{l,1,n} * h_lk);
+                end
+            end
+            
+            SINR = signal_power / (interference + sigma2);
+            rate = rate + log2(1 + max(SINR, 1e-12));
+        end
+    end
+end
+

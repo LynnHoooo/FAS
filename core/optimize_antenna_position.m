@@ -199,9 +199,11 @@ function R_sum = compute_sum_rate_with_t(t, q_traj, alpha_mkn, W_mkn, R_mkn, ...
                                 interference = interference + real(h_lk' * W_mkn{l,i,n} * h_lk);
                             end
                         end
-                        % 修复：计算来自所有GBS的感知干扰（与标准模型一致）
-                        h_lk = compute_channel_t(l, k, n, t, q_traj, u, H, Na, kappa);
-                        interference = interference + real(h_lk' * R_mkn{l,1,n} * h_lk);
+                        % 感知干扰：只计算当前服务GBS的感知信号
+                        if l == m
+                            h_mk_sense = compute_channel_t(m, k, n, t, q_traj, u, H, Na, kappa);
+                            interference = interference + real(h_mk_sense' * R_mkn{m,1,n} * h_mk_sense);
+                        end
                     end
                     
                     % SINR和速率

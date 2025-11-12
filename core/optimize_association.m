@@ -54,7 +54,7 @@ function alpha = optimize_association(h_mkn_precomputed, W, R, Pmax, sigma2, M, 
                 alpha_temp(m, k, 1) = 1;  % 假设UAV k由GBS m服务
                 
                 % 使用标准SINR计算函数
-                [~, rate] = compute_sinr_standard(h_mkn_precomputed, W_temp, R, alpha_temp, sigma2, m, k, 1, M, K);
+                [~, rate] = compute_sinr(h_mkn_precomputed, W_temp, R, alpha_temp, sigma2, m, k, 1, M, K);
                 rates(m) = rate;
             end
             
@@ -217,4 +217,42 @@ function alpha = optimize_association(h_mkn_precomputed, W, R, Pmax, sigma2, M, 
             W_eff = W_candidate;
         end
     end
+end
+
+%% 缺失的辅助函数
+function [SINR_val, rate] = compute_sinr(h_mkn_precomputed, W, R, alpha, sigma2, m_eval, k_eval, n_eval, M, K)
+% 计算指定用户的SINR和速率
+    h_mk = h_mkn_precomputed{m_eval, k_eval, n_eval};
+    if isempty(h_mk)
+        SINR_val = 0;
+        rate = 0;
+        return;
+    end
+    
+    % 信号功率
+    signal_power = real(h_mk' * W{m_eval, k_eval, n_eval} * h_mk);
+    
+    % 干扰功率
+    interference = 0;
+    for l = 1:M
+        for i = 1:K
+            if ~(l == m_eval && i == k_eval) && alpha(l, i, n_eval) == 1
+                h_lk = h_mkn_precomputed{l, k_eval, n_eval};
+                if ~isempty(h_lk) && ~isempty(W{l, i, n_eval})
+                    interference = interference + real(h_lk' * W{l, i, n_eval} * h_lk);
+                end
+            end
+        end
+        % 感知信号干扰
+        if ~isempty(R) && ~isempty(R{l, 1, n_eval})
+            h_lk = h_mkn_precomputed{l, k_eval, n_eval};
+            if ~isempty(h_lk)
+                interference = interference + real(h_lk' * R{l, 1, n_eval} * h_lk);
+            end
+        end
+    end
+    
+    % SINR和速率
+    SINR_val = signal_power / (interference + sigma2);
+    rate = log2(1 + max(SINR_val, 1e-12));
 end
