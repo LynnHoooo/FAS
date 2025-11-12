@@ -33,6 +33,9 @@ p.t_start = t_start;    % 天线阵列起始坐标
 p.t_end = t_end;        % 天线阵列结束坐标
 p.d_min = d_min;        % 最小间距约束
 
+% === AO算法参数设置 ===
+p.max_iterations = 3;   % 设置为3次迭代（简单测试）
+
 fprintf('✅ 参数结构体组装完成（含FAS参数）。\n');
 fprintf('   FAS: %d个GBS，孔径[%.1f, %.1f]λ，d_min=%.2fλ\n', M, t_start, t_end, d_min);
 
