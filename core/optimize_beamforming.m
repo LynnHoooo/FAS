@@ -1,6 +1,6 @@
 function [W_opt, R_opt, obj_history] = optimize_beamforming(...
     h_mkn_precomputed, alpha_mkn, R_mn_init, W_mkn_init, ...
-    Pmax, Gamma, sigma2, M, K, N, Na, Q, v, u, H_sense, kappa, t)
+    Pmax, Gamma, sigma2, M, K, N, Na, Q, v, u, H_sense, kappa, t_positions)
 % OPTIMIZE_BEAMFORMING - 基于SCA+SDR的ISAC波束成形优化（修复版）
 %
 % 输入:
@@ -36,21 +36,20 @@ function [W_opt, R_opt, obj_history] = optimize_beamforming(...
     use_sensing_slack = true;   % 使用松弛约束，平衡通信与感知
     rho_slack = 1e6; % 增大惩罚系数，更重视感知约束（原1e3改为1e6，增大1000倍）
 
-    % 若未提供位置向量 t，则回退为等间距（兼容旧调用）
-    if ~exist('t','var') || isempty(t)
-        d_lambda = 0.5;
-        t = (0:Na-1)' * d_lambda;
-    else
-        t = t(:);
-        if numel(t) ~= Na
-            error('optimize_beamforming:InvalidT', '位置向量 t 的长度应为 Na');
+    % FAS位置向量验证
+    if ~iscell(t_positions) || length(t_positions) ~= M
+        error('optimize_beamforming:InvalidTPositions', 'FAS位置向量 t_positions 应为长度为M的cell数组');
+    end
+    for m = 1:M
+        if length(t_positions{m}) ~= Na
+            error('optimize_beamforming:InvalidTPositions', 'GBS %d 的位置向量长度应为 Na=%d', m, Na);
         end
     end
 
-    % 可行性预检
-    sensing_stats = compute_sensing_statistics(alpha_mkn, W_mkn_init, R_mn_init, ...
-        v, u, H_sense, kappa, M, K, N, Na);
-    fprintf('  [预检] 初始最小感知功率: %.4e W (Gamma = %.4e W)\n', sensing_stats.min_power, Gamma);
+    % 可行性预检 - 使用FAS导向矢量计算感知功率
+    initial_min_sensing = compute_sensing_power_local(alpha_mkn, W_mkn_init, R_mn_init, ...
+        u, v, M, 1, N, Na, kappa, t_positions, H_sense);  % Q=1 for quick check
+    fprintf('  [预检] 初始最小感知功率: %.4e W (Gamma = %.4e W)\n', initial_min_sensing, Gamma);
     power_stats = compute_power_statistics(W_mkn_init, R_mn_init, Pmax, M, K, N);
     fprintf('  [预检] 最大功率占用: %.4f / %.4f W\n', power_stats.max_usage, Pmax);
 
@@ -59,8 +58,8 @@ function [W_opt, R_opt, obj_history] = optimize_beamforming(...
     for o = 1:max_sca_iter
         fprintf('=== SCA 迭代 %d ===\n', o);
         
-        % 计算当前真实和速率作为目标值
-        obj_current = compute_sum_rate(h_mkn_precomputed, W_opt, R_opt, alpha_mkn, sigma2, M, K, N);
+        % 计算当前真实和速率 - 使用唯一真理函数
+        [obj_current, ~] = calculate_master_rate_function(W_opt, R_opt, h_mkn_precomputed, alpha_mkn, sigma2, M, K, N);
         obj_history(end+1) = obj_current;
         fprintf('  当前和速率: %.4f bps/Hz\n', obj_current);
 
@@ -95,10 +94,10 @@ function [W_opt, R_opt, obj_history] = optimize_beamforming(...
                             dz = H_sense;
                             dist_3d = sqrt(dx^2 + dy^2 + dz^2);
 
-                            % 入射角和导向矢量（使用位置向量 t）
+                            % 入射角和FAS导向矢量（使用GBS m的天线位置向量）
                             theta = acos(dz / dist_3d);
-                            a_vec = exp(1j * 2*pi * t * cos(theta));
-                            a_vec = a_vec / norm(a_vec);
+                            a_vec = exp(1j * 2*pi * t_positions{m} * cos(theta));
+                            % 删除错误的归一化 - 导向矢量不应该被归一化
 
                             % 修改：使用归一化功率（忽略kappa），与initial.m保持一致
                             % beta = kappa / (dist_3d^2);  % 旧版本
@@ -173,50 +172,112 @@ function [W_opt, R_opt, obj_history] = optimize_beamforming(...
     % 秩一重构（简单主特征向量法）
     [W_opt, R_opt] = rank_one_reconstruction(W_opt, R_opt, h_mkn_precomputed, alpha_mkn, M, K, N, Na);
 
-    % 最终约束统计输出
-    final_sensing_stats = compute_sensing_statistics(alpha_mkn, W_opt, R_opt, v, u, H_sense, kappa, M, K, N, Na);
+    % 最终约束统计输出 - 使用FAS导向矢量
+    final_min_sensing = compute_sensing_power_local(alpha_mkn, W_opt, R_opt, ...
+        u, v, M, Q, N, Na, kappa, t_positions, H_sense);
     final_power_stats = compute_power_statistics(W_opt, R_opt, Pmax, M, K, N);
     fprintf('  [最终] 最小感知功率: %.4e W, 最大功率占用: %.4f / %.4f W\n', ...
-        final_sensing_stats.min_power, final_power_stats.max_usage, Pmax);
+        final_min_sensing, final_power_stats.max_usage, Pmax);
 
 end
 
 
 %% ========== 内部辅助函数 ==========
-function rate = sum_rate_SCA_approximation(...
-    h_mkn, alpha, W_cvx, R_cvx, W_old, R_old, sigma2, M, K, N)
-% SCA 近似的和速率（凹函数上界）
+function rate = sum_rate_SCA_approximation(h_mkn, alpha, W_cvx, R_cvx, W_old, R_old, sigma2, M, K, N)
+% 论文1 Equation (16) 的严谨DC近似 - 完整实现
+% 
+% 真实速率形式：r_{m,k}[n] = log₂(S+I+N) - log₂(I+N)
+% SCA近似：max[Concave₁ - Affine₂]，其中：
+% - Concave₁ = log₂(tr(H_{m,k}(∑W + ∑R)) + σ²) - 保持凹函数
+% - Affine₂ = a_{m,k}^{(o)}[n] + ∑tr(B_{m,k}^{(o)}(W-W^{(o)})) + ∑tr(B_{m,k}^{(o)}(R-R^{(o)}))
 
     rate = 0;
     for n = 1:N
-        for m = 1:M
-            for k = 1:K
-                if alpha(m,k,n) == 1
-                    h_mk = h_mkn{m,k,n};
-                    
-                    % 分母：干扰 + 噪声（基于旧解）
-                    den = sigma2;
-                    for l = 1:M
-                        for i = 1:K
-                            if ~(l==m && i==k) && ~isempty(W_old{l,i,n})
-                                h_lk = h_mkn{l,k,n};
-                                den = den + real(h_lk' * W_old{l,i,n} * h_lk);
-                            end
-                        end
-                        if ~isempty(R_old{l,1,n})
+        for k = 1:K
+            % 找到服务该用户的GBS（与真实速率函数完全一致）
+            m_serv = find(alpha(:,k,n) == 1, 1);
+            
+            if ~isempty(m_serv) && ~isempty(W_old{m_serv,k,n})
+                h_mk = h_mkn{m_serv,k,n};
+                
+                % === 计算干扰项I（与calculate_master_rate_function完全一致） ===
+                interference_old = 0;
+                
+                % 1. 通信干扰：来自其他GBS和用户的通信信号
+                for l = 1:M
+                    for i = 1:K
+                        if ~(l == m_serv && i == k) && alpha(l,i,n) == 1 && ~isempty(W_old{l,i,n})
                             h_lk = h_mkn{l,k,n};
-                            den = den + real(h_lk' * R_old{l,1,n} * h_lk);
+                            interference_old = interference_old + real(h_lk' * W_old{l,i,n} * h_lk);
                         end
                     end
-                    
-                    % 信号功率（凸函数）
-                    signal_power = real(h_mk' * W_cvx(:,:,m,k,n) * h_mk);
-                    
-                    % SCA线性近似 log(1+x) ≈ log(1+x0) + (x-x0)/(ln2*(1+x0))
-                    x0 = max(real(h_mk' * W_old{m,k,n} * h_mk) / den, 1e-6);
-                    rate_term = log2(1 + x0) + (signal_power/den - x0) / (log(2)*(1 + x0));
-                    rate = rate + rate_term;
                 end
+                
+                % 2. 感知干扰：来自所有GBS的感知信号
+                for l = 1:M
+                    if ~isempty(R_old{l,1,n})
+                        h_lk = h_mkn{l,k,n};
+                        interference_old = interference_old + real(h_lk' * R_old{l,1,n} * h_lk);
+                    end
+                end
+                
+                % === 论文1 Equation (16) 的完整DC近似 ===
+                
+                % Concave₁: log₂(S+I+N) - 使用CVX变量
+                signal_new = real(h_mk' * W_cvx(:,:,m_serv,k,n) * h_mk);
+                
+                % 重新计算新的干扰项（使用CVX变量）
+                interference_new = 0;
+                for l = 1:M
+                    for i = 1:K
+                        if ~(l == m_serv && i == k) && alpha(l,i,n) == 1
+                            h_lk = h_mkn{l,k,n};
+                            interference_new = interference_new + real(h_lk' * W_cvx(:,:,l,i,n) * h_lk);
+                        end
+                    end
+                end
+                for l = 1:M
+                    h_lk = h_mkn{l,k,n};
+                    interference_new = interference_new + real(h_lk' * R_cvx(:,:,l,n) * h_lk);
+                end
+                
+                concave1 = log(signal_new + interference_new + sigma2) / log(2);
+                
+                % Affine₂: 论文Eq.16的仿射上界
+                % a_{m,k}^{(o)}[n] - 常数项
+                a_const = log(interference_old + sigma2) / log(2);
+                
+                % B_{m,k}^{(o)}[n] - 梯度矩阵项
+                % ∇log₂(I+N) = (1/(ln2*(I+N))) * ∇(I+N)
+                gradient_coeff = 1 / (log(2) * (interference_old + sigma2));
+                
+                % 计算梯度项：∑tr(B_{m,k}^{(o)}(W-W^{(o)})) + ∑tr(B_{m,k}^{(o)}(R-R^{(o)}))
+                gradient_term = 0;
+                
+                % W的梯度项
+                for l = 1:M
+                    for i = 1:K
+                        if ~(l == m_serv && i == k) && alpha(l,i,n) == 1
+                            h_lk = h_mkn{l,k,n};
+                            B_matrix = gradient_coeff * (h_lk * h_lk');
+                            gradient_term = gradient_term + real(trace(B_matrix * (W_cvx(:,:,l,i,n) - W_old{l,i,n})));
+                        end
+                    end
+                end
+                
+                % R的梯度项
+                for l = 1:M
+                    h_lk = h_mkn{l,k,n};
+                    B_matrix = gradient_coeff * (h_lk * h_lk');
+                    gradient_term = gradient_term + real(trace(B_matrix * (R_cvx(:,:,l,n) - R_old{l,1,n})));
+                end
+                
+                affine2 = a_const + gradient_term;
+                
+                % 最终的DC近似：Concave₁ - Affine₂
+                rate_term = concave1 - affine2;
+                
+                rate = rate + rate_term;
             end
         end
     end
@@ -278,4 +339,44 @@ function stats = compute_power_statistics(W_cells, R_cells, Pmax, M, K, N)
         end
     end
     stats.max_usage = max_usage;
+end
+
+function min_sensing_power = compute_sensing_power_local(alpha_mkn, W_mkn, R_mkn, u, v, M, Q, N, Na, kappa, t_positions, H_sense)
+% 本地感知功率计算函数 - 使用FAS导向矢量
+    K = size(alpha_mkn, 2);
+    zeta_qn = zeros(Q, N);
+
+    for n = 1:N
+        for q_idx = 1:Q
+            total_power = 0;
+            for m = 1:M
+                composite = zeros(Na, Na);
+                for k = 1:K
+                    if ~isempty(W_mkn{m, k, n})
+                        composite = composite + W_mkn{m, k, n};
+                    end
+                end
+                if ~isempty(R_mkn{m, 1, n})
+                    composite = composite + R_mkn{m, 1, n};
+                end
+
+                dx = v(q_idx, 1) - u(m, 1);
+                dy = v(q_idx, 2) - u(m, 2);
+                dist = sqrt(dx^2 + dy^2 + H_sense^2);
+
+                % 归一化功率
+                path_loss = 1 / (dist^2);
+
+                cos_theta = H_sense / dist;
+                % FAS导向矢量：使用当前GBS m的天线位置向量
+                steering = exp(1j * t_positions{m} * 2 * pi * cos_theta);
+
+                total_power = total_power + path_loss * real(steering' * composite * steering);
+            end
+
+            zeta_qn(q_idx, n) = total_power;
+        end
+    end
+
+    min_sensing_power = min(zeta_qn(:));
 end

@@ -87,7 +87,7 @@ R_current = R_init;  % 添加R_current跟踪当前感知波束
 
 % 计算初始性能
     [initial_sum_rate, initial_min_sensing] = evaluate_performance(h_mkn, alpha_current, W_current, R_init, ...
-    u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, d, H_sense);
+    u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, t_current, H_sense);
 
 fprintf('🚀 开始AO算法主循环...\n');
 fprintf('初始和速率: %.4f bps/Hz\n', initial_sum_rate);
@@ -123,20 +123,16 @@ ao_history.trust_regions(1) = trust_region;
 for iter = 1:max_iterations
     fprintf('\n=== AO迭代 %d/%d ===\n', iter, max_iterations);
     
-    % 子问题1: 优化关联（使用当前的R_current而不是R_init）
-    fprintf('  步骤1: 关联优化...\n');
+    % 子问题1: 优化关联 α (固定 t, W, R, q)
+    fprintf('  子问题1: 关联优化...\n');
     alpha_new = optimize_association(h_mkn, W_current, R_current, Pmax, sigma2, M, K, N, Na);
-    % 注意：不重新构建W_new，直接使用W_current作为波束优化的初始点
-    % 这样可以保持迭代的连续性，避免第一次SCA虚高的问题
     
-    % 子问题2: 优化波束成形（使用当前解作为初始点）
-    fprintf('  步骤2: 波束优化...\n');
+    % 子问题2: 优化波束 W, R (固定 t, α, q)
+    fprintf('  子问题2: 波束优化...\n');
     try
-        % 注意：optimize_beamforming接受单个位置向量，使用GBS1的位置作为代表
-        % 这是为了与原始系统保持兼容性的临时方案
         [W_new, R_new, ~] = optimize_beamforming(...
             h_mkn, alpha_new, R_current, W_current, ...
-            Pmax, Gamma, sigma2, M, K, N, Na, Q, v, u, H_sense, kappa, t_current{1});
+            Pmax, Gamma, sigma2, M, K, N, Na, Q, v, u, H_sense, kappa, t_current);
         fprintf('    ✅ 波束优化成功\n');
     catch ME
         fprintf('    ⚠️ 波束优化失败: %s\n', ME.message);
@@ -144,8 +140,8 @@ for iter = 1:max_iterations
         R_new = R_current;
     end
     
-    % 子问题2.5: 天线位置优化（真正的SCA优化，每个GBS独立优化）
-    fprintf('  步骤2.5: 天线位置优化（每个GBS独立）...\n');
+    % 子问题3: 优化位置 t (固定 W, R, α, q) - FAS核心优化
+    fprintf('  子问题3: 天线位置优化（FAS核心）...\n');
     if isfield(p, 't_start'), t_start = p.t_start; else, t_start = 0; end
     if isfield(p, 't_end'), t_end = p.t_end; else, t_end = (Na-1) * d; end
     if isfield(p, 'd_min'), d_min = p.d_min; else, d_min = 0.1; end
@@ -185,8 +181,8 @@ for iter = 1:max_iterations
         fprintf('    ✅ 天线位置优化和信道更新完成\n');
     end
     
-    % 子问题3: 优化轨迹
-    fprintf('  步骤3: 轨迹优化...\n');
+    % 子问题4: 优化轨迹 q (固定 t, W, R, α)
+    fprintf('  子问题4: 轨迹优化...\n');
     params.M = M; params.K = K; params.N = N; params.Na = Na;
     params.d = d; params.kappa = kappa; params.sigma2 = sigma2;
     params.dt = dt; params.Vmax = Vmax; params.v = v;
@@ -222,7 +218,7 @@ for iter = 1:max_iterations
     % 计算性能并记录（注意：由于第0次迭代已占用索引1，实际AO迭代从索引2开始）
     fprintf('  步骤4: 性能评估...\n');
     [current_sum_rate, current_min_sensing] = evaluate_performance(...
-        h_mkn, alpha_new, W_new, R_new, u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, d, H_sense);
+        h_mkn, alpha_new, W_new, R_new, u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, t_current, H_sense);
     
     % 验证性能单调性（AO算法理论上应保证目标函数单调递增）
     if iter >= 1 && current_sum_rate < sum_rate_history(iter) - 1e-6
@@ -379,13 +375,13 @@ end
 
 function [avg_sum_rate, min_sensing_power] = evaluate_performance( ...
     h_mkn_precomputed, alpha_mkn, W_mkn, R_mkn, ...
-    u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, d, H_sense)
+    u, v, M, K, N, Q, Na, Pmax, sigma2, Gamma, kappa, t_positions, H_sense)
 
-    % 计算平均和速率
-    avg_sum_rate = compute_sum_rate(h_mkn_precomputed, W_mkn, R_mkn, alpha_mkn, sigma2, M, K, N);
+        % 计算平均和速率 - 使用唯一真理函数
+        [avg_sum_rate, ~] = calculate_master_rate_function(W_mkn, R_mkn, h_mkn_precomputed, alpha_mkn, sigma2, M, K, N);
 
     % 计算最小感知功率
-    min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v, M, Q, N, Na, kappa, d, H_sense);
+    min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v, M, Q, N, Na, kappa, t_positions, H_sense);
 
 end
 
@@ -467,7 +463,7 @@ function W_reconstructed = reconstruct_beamforming_for_association(alpha_mkn, h_
     end
 end
 
-function min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v, M, Q, N, Na, kappa, d, H_sense)
+function min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v, M, Q, N, Na, kappa, t_positions, H_sense)
     K = size(alpha_mkn, 2);
     zeta_qn = zeros(Q, N);
 
@@ -490,7 +486,8 @@ function min_sensing_power = compute_sensing_power(alpha_mkn, W_mkn, R_mkn, u, v
                 path_loss = 1 / (dist^2);  % 新版本：归一化功率
 
                 cos_theta = H_sense / dist;
-                steering = exp(1j * (0:Na-1)' * 2 * pi * d * cos_theta);
+                % FAS导向矢量：使用当前GBS m的天线位置向量
+                steering = exp(1j * t_positions{m} * 2 * pi * cos_theta);
 
                 total_power = total_power + path_loss * real(steering' * composite * steering);
             end
@@ -580,39 +577,6 @@ function [q_updated, h_updated] = position_search_2d(q_current, h_current, W_mkn
     end
 end
 
-%% 缺失的辅助函数
-function rate = compute_sum_rate(h_mkn_precomputed, W_mkn, R_mkn, alpha_mkn, sigma2, M, K, N)
-% 计算系统总和速率
-    rate = 0;
-    for n = 1:N
-        for k = 1:K
-            m_serv = find(alpha_mkn(:,k,n) == 1, 1);
-            if isempty(m_serv)
-                continue;
-            end
-            
-            h_mk = h_mkn_precomputed{m_serv,k,n};
-            signal_power = real(h_mk' * W_mkn{m_serv,k,n} * h_mk);
-            
-            interference = 0;
-            % 来自其他GBS和用户的干扰
-            for l = 1:M
-                for i = 1:K
-                    if ~(l==m_serv && i==k) && alpha_mkn(l,i,n) == 1
-                        h_lk = h_mkn_precomputed{l,k,n};
-                        interference = interference + real(h_lk' * W_mkn{l,i,n} * h_lk);
-                    end
-                end
-                % 感知信号干扰
-                if ~isempty(R_mkn) && ~isempty(R_mkn{l,1,n})
-                    h_lk = h_mkn_precomputed{l,k,n};
-                    interference = interference + real(h_lk' * R_mkn{l,1,n} * h_lk);
-                end
-            end
-            
-            SINR = signal_power / (interference + sigma2);
-            rate = rate + log2(1 + max(SINR, 1e-12));
-        end
-    end
-end
+%% 注意：compute_sum_rate 函数已删除
+% 所有速率计算现在统一使用 calculate_master_rate_function
 
