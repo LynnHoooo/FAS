@@ -54,67 +54,96 @@ function [t_opt, obj_history] = optimize_antenna_position(...
     for sca_iter = 1:max_sca_iter
         % 步骤1: 计算当前目标值
         % 计算当前真实和速率 - 使用唯一真理函数
-        % 首先构建当前位置下的信道矩阵
-        h_current = cell(M, K, N);
+        % 步骤1: 预计算当前位置的信道矩阵（统一计算，避免重复）
+        h_mkn_current = cell(M, K, N);
         for m = 1:M
             for k = 1:K
                 for n = 1:N
                     if m == 1
-                        h_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_old, Na);
+                        h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_old, Na);
                     else
-                        h_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_all_fixed{m}, Na);
+                        h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_all_fixed{m}, Na);
                     end
                 end
             end
         end
-        [R_old, ~] = calculate_master_rate_function(W_mkn, R_mkn, h_current, alpha_mkn, sigma2, M, K, N);
+        
+        % 步骤2: 使用统一的信道矩阵计算真实速率
+        [R_old, ~] = calculate_master_rate_function(W_mkn, R_mkn, h_mkn_current, alpha_mkn, sigma2, M, K, N);
         obj_history(end+1) = R_old;
         
         if sca_iter == 1
             fprintf('    迭代 %d: R_sum = %.4f bps/Hz\n', sca_iter, R_old);
         end
         
-        % 步骤2: 计算所有需要的梯度 - 论文2两层SCA第一层
-        [g_all, grad_g_all] = compute_all_gradients(t_old, t_all_fixed, q_traj, alpha_mkn, W_mkn, R_mkn, ...
-            u, H, M, K, N, Na, kappa, sigma2);
+        % 步骤3: 论文2两层SCA - 基于唯一数学真理
+        % 第一层：线性化功率项 g(t) = h(t)^H W h(t)
+        % 第二层：DC近似 log₂(S+I+N) - log₂(I+N)
         
-        % 步骤3: 构建CVX优化问题（两步SCA）
+        % 使用calculate_master_rate_function获取真实的功率分解（唯一真理）
+        [R_old_verify, power_breakdown] = calculate_master_rate_function(W_mkn, R_mkn, h_mkn_current, alpha_mkn, sigma2, M, K, N);
+        
+        % 验证数学一致性
+        if abs(R_old - R_old_verify) > 1e-6
+            warning('Step 6数学不一致: R_old=%.4f vs R_old_verify=%.4f', R_old, R_old_verify);
+        end
+        
+        % 计算所有功率项的梯度（基于真实功率值）
+        [power_gradients] = compute_power_gradients_from_breakdown(power_breakdown, t_old, t_all_fixed, ...
+            h_mkn_current, alpha_mkn, W_mkn, R_mkn, u, q_traj, H, M, K, N, Na, kappa);
+        
+        % 构建CVX优化问题（论文2两层SCA）
         cvx_begin quiet
             cvx_precision low
             variable t_var(Na, 1)
             
-            % 目标函数初始化
+            % 目标函数：基于论文1的DC方法应用于位置变量t
             obj_expr = 0;
             
-            % 论文2 两层SCA：对每个有效链路构建DC近似目标
+            % 对每个有效链路应用两层SCA
             for n = 1:N
                 for k = 1:K
-                    % 找到服务该用户的GBS（与真实速率函数完全一致）
                     m_serv = find(alpha_mkn(:,k,n) == 1, 1);
                     
-                    if ~isempty(m_serv) && ~isempty(g_all{m_serv,k,n})
-                        % 提取功率项和梯度
-                        g_vec = g_all{m_serv,k,n};  % [signal; comm_interf; sense_interf; total_num; total_den]
-                        grad_mat = grad_g_all{m_serv,k,n};  % Na×5 矩阵
+                    if ~isempty(m_serv) && ~isempty(W_mkn{m_serv,k,n})
+                        % 从power_breakdown获取当前功率值
+                        S_old = power_breakdown.signal{m_serv,k,n};
+                        I_comm_old = power_breakdown.comm_interference{m_serv,k,n};
+                        I_sense_old = power_breakdown.sense_interference{m_serv,k,n};
                         
-                        % 正确的两层DC近似
+                        % 总功率项
+                        numerator_old = S_old + I_comm_old + I_sense_old + sigma2;  % S+I+N
+                        denominator_old = I_comm_old + I_sense_old + sigma2;        % I+N
                         
-                        % Concave₁: log₂(S̃+Ĩ+N) - 完整的线性化
-                        total_num_linearized = g_vec(4) + grad_mat(:,4)' * (t_var - t_old);
-                        concave1 = log(total_num_linearized) / log(2);
-                        
-                        % Affine₂: log₂(Ĩ+N) 的仿射上界（泰勒展开）
-                        denominator_old = g_vec(5);
-                        grad_denominator = grad_mat(:,5);
-                        a_const = log(denominator_old) / log(2);
-                        b_vec = (1 / (log(2) * denominator_old)) * grad_denominator;
-                        affine2 = a_const + b_vec' * (t_var - t_old);
-                        
-                        % 最终的凹目标：Concave₁ - Affine₂
-                        rate_term = concave1 - affine2;
-                        
-                        % 累加到目标
-                        obj_expr = obj_expr + rate_term;
+                        % 从梯度结构获取对应梯度
+                        if isfield(power_gradients, 'signal') && ~isempty(power_gradients.signal{m_serv,k,n})
+                            grad_S = power_gradients.signal{m_serv,k,n};
+                            grad_I_comm = power_gradients.comm_interference{m_serv,k,n};
+                            grad_I_sense = power_gradients.sense_interference{m_serv,k,n};
+                            
+                            % 总梯度
+                            grad_numerator = grad_S + grad_I_comm + grad_I_sense;    % ∇(S+I+N)
+                            grad_denominator = grad_I_comm + grad_I_sense;          % ∇(I+N)
+                            
+                            % 第一层SCA：线性化功率项
+                            % g̃(t) = g(t⁰) + ∇g(t⁰)ᵀ(t - t⁰)
+                            numerator_linearized = numerator_old + grad_numerator' * (t_var - t_old);
+                            denominator_linearized = denominator_old + grad_denominator' * (t_var - t_old);
+                            
+                            % 第二层SCA：DC近似 log₂(g̃₁) - log₂(g̃₂)
+                            % Concave₁: log₂(g̃₁) - 保持凹性
+                            concave1 = log(numerator_linearized) / log(2);
+                            
+                            % Concave₂: log₂(g̃₂) - 用仿射上界替换
+                            % log₂(g̃₂) ≈ log₂(g₂⁰) + (∇g₂⁰/g₂⁰)/ln(2) * (g̃₂ - g₂⁰)
+                            affine2_const = log(denominator_old) / log(2);
+                            affine2_linear = (grad_denominator' * (t_var - t_old)) / (log(2) * denominator_old);
+                            affine2 = affine2_const + affine2_linear;
+                            
+                            % 最终SCA目标：Concave₁ - Affine₂
+                            rate_term = concave1 - affine2;
+                            obj_expr = obj_expr + rate_term;
+                        end
                     end
                 end
             end
@@ -215,8 +244,6 @@ function [t_opt, obj_history] = optimize_antenna_position(...
                         D_min_eig = min(D_eigs);
                         D_max_eig = max(D_eigs);
                         
-                        fprintf('      感知点%d: D特征值范围[%.2e, %.2e], Gamma_prime=%.2e\n', ...
-                            q_idx, D_min_eig, D_max_eig, Gamma_prime);
                         
                         % 确保D矩阵是负半定的（凹函数要求）
                         if D_max_eig > 1e-10
@@ -355,124 +382,73 @@ function h = compute_channel_t(m, k, n, t, q_traj, u, H, Na, kappa)
     h = sqrt(beta) * g;
 end
 
-%% 辅助函数4: 计算功率项梯度 - 论文2的两层SCA第一层
-function [g_all, grad_g_all] = compute_all_gradients(t, t_all_fixed, q_traj, alpha_mkn, W_mkn, R_mkn, ...
-    u, H, M, K, N, Na, kappa, sigma2)
-    % 论文2 两层SCA的第一层：对功率项g(t) = |w^H h(t)|^2 进行线性化
-    % 必须与calculate_master_rate_function使用完全相同的干扰模型
+%% 辅助函数4: 基于功率分解的梯度计算 - 确保唯一数学真理
+function [power_gradients] = compute_power_gradients_from_breakdown(power_breakdown, t_old, t_all_fixed, ...
+    h_mkn_current, alpha_mkn, W_mkn, R_mkn, u, q_traj, H, M, K, N, Na, kappa)
+    % 基于calculate_master_rate_function的真实功率分解计算梯度
+    % 不再重新计算功率值，确保与"唯一真理"完全一致
     
-    g_all = cell(M, K, N);
-    grad_g_all = cell(M, K, N);
+    % 初始化梯度结构
+    power_gradients.signal = cell(M, K, N);
+    power_gradients.comm_interference = cell(M, K, N);
+    power_gradients.sense_interference = cell(M, K, N);
     
-    % 使用与calculate_master_rate_function完全相同的循环结构
+    % 计算梯度：只有GBS1的位置是变量
     for n = 1:N
         for k = 1:K
-            % 找到服务该用户的GBS（与真实速率函数完全一致）
             m_serv = find(alpha_mkn(:,k,n) == 1, 1);
             
-            if ~isempty(m_serv) && ~isempty(W_mkn{m_serv,k,n})
-                % 计算当前位置的信道
-                if m_serv == 1
-                    h_mk = get_channel(m_serv, k, n, u, q_traj, H, kappa, t, Na);
+            if ~isempty(m_serv) && ~isempty(W_mkn{m_serv,k,n}) && ~isempty(power_breakdown.signal{m_serv,k,n})
+                % 1. 信号功率梯度 ∇S(t)
+                if m_serv == 1  % 只有GBS1的位置是变量
+                    h_mk = h_mkn_current{m_serv,k,n};
+                    power_gradients.signal{m_serv,k,n} = compute_power_gradient_unified(h_mk, W_mkn{m_serv,k,n}, u, q_traj, H, k, n, Na, kappa);
                 else
-                    h_mk = get_channel(m_serv, k, n, u, q_traj, H, kappa, t_all_fixed{m_serv}, Na);
+                    power_gradients.signal{m_serv,k,n} = zeros(Na, 1);
                 end
                 
-                % === 计算所有功率项（与calculate_master_rate_function完全一致） ===
-                
-                % 信号功率 g_signal(t)
-                signal_power = real(h_mk' * W_mkn{m_serv,k,n} * h_mk);
-                
-                % 通信干扰功率 g_comm_interf(t)
-                comm_interference = 0;
+                % 2. 通信干扰功率梯度 ∇I_comm(t)
+                grad_comm = zeros(Na, 1);
                 for l = 1:M
                     for i = 1:K
                         if ~(l == m_serv && i == k) && alpha_mkn(l,i,n) == 1
-                            if l == 1
-                                h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t, Na);
-                            else
-                                h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t_all_fixed{l}, Na);
-                            end
-                            comm_interference = comm_interference + real(h_lk' * W_mkn{l,i,n} * h_lk);
-                        end
-                    end
-                end
-                
-                % 感知干扰功率 g_sense_interf(t)
-                sense_interference = 0;
-                for l = 1:M
-                    if l == 1
-                        h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t, Na);
-                    else
-                        h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t_all_fixed{l}, Na);
-                    end
-                    sense_interference = sense_interference + real(h_lk' * R_mkn{l,1,n} * h_lk);
-                end
-                
-                % 总功率项：用于DC分解的分子和分母
-                total_power_numerator = signal_power + comm_interference + sense_interference + sigma2;
-                total_power_denominator = comm_interference + sense_interference + sigma2;
-                
-                % 存储功率值（用于两层SCA）
-                g_vec = [signal_power; comm_interference; sense_interference; total_power_numerator; total_power_denominator];
-                g_all{m_serv,k,n} = g_vec;
-                
-                % === 计算梯度（第一层SCA：线性化功率项） ===
-                % 只有GBS1的位置是变量，其他GBS位置固定
-                grad_g_mat = zeros(Na, 5);  % Na × 5 (对应5个功率项)
-                
-                if m_serv == 1
-                    % 1. 计算信号功率梯度 ∇g_signal(t)
-                    grad_g_mat(:,1) = compute_power_gradient(h_mk, W_mkn{m_serv,k,n}, u, q_traj, H, k, n, Na, kappa);
-                    
-                    % 2. 计算通信干扰梯度 ∇g_comm_interf(t)
-                    grad_comm_interf = zeros(Na, 1);
-                    for l = 1:M
-                        for i = 1:K
-                            if ~(l == m_serv && i == k) && alpha_mkn(l,i,n) == 1
-                                if l == 1  % GBS1产生的干扰（位置变量）
-                                    h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t, Na);
-                                    grad_comm_interf = grad_comm_interf + compute_power_gradient(h_lk, W_mkn{l,i,n}, u, q_traj, H, k, n, Na, kappa);
+                            if l == 1  % 只有GBS1产生的干扰有梯度
+                                h_lk = h_mkn_current{l,k,n};
+                                if ~isempty(W_mkn{l,i,n})
+                                    grad_comm = grad_comm + compute_power_gradient_unified(h_lk, W_mkn{l,i,n}, u, q_traj, H, k, n, Na, kappa);
                                 end
-                                % 其他GBS位置固定，梯度为0
                             end
                         end
                     end
-                    grad_g_mat(:,2) = grad_comm_interf;
-                    
-                    % 3. 计算感知干扰梯度 ∇g_sense_interf(t)
-                    grad_sense_interf = zeros(Na, 1);
-                    for l = 1:M
-                        if l == 1  % GBS1产生的感知干扰（位置变量）
-                            h_lk = get_channel(l, k, n, u, q_traj, H, kappa, t, Na);
-                            grad_sense_interf = grad_sense_interf + compute_power_gradient(h_lk, R_mkn{l,1,n}, u, q_traj, H, k, n, Na, kappa);
-                        end
-                        % 其他GBS位置固定，梯度为0
-                    end
-                    grad_g_mat(:,3) = grad_sense_interf;
-                    
-                    % 4. 计算总分子梯度 ∇(S+I_c+I_s+N)
-                    grad_g_mat(:,4) = grad_g_mat(:,1) + grad_g_mat(:,2) + grad_g_mat(:,3);
-                    
-                    % 5. 计算总分母梯度 ∇(I_c+I_s+N)
-                    grad_g_mat(:,5) = grad_g_mat(:,2) + grad_g_mat(:,3);
                 end
+                power_gradients.comm_interference{m_serv,k,n} = grad_comm;
                 
-                grad_g_all{m_serv,k,n} = grad_g_mat;
+                % 3. 感知干扰功率梯度 ∇I_sense(t)
+                grad_sense = zeros(Na, 1);
+                for l = 1:M
+                    if l == 1  % 只有GBS1产生的感知干扰有梯度
+                        h_lk = h_mkn_current{l,k,n};
+                        if ~isempty(R_mkn{l,1,n})
+                            grad_sense = grad_sense + compute_power_gradient_unified(h_lk, R_mkn{l,1,n}, u, q_traj, H, k, n, Na, kappa);
+                        end
+                    end
+                end
+                power_gradients.sense_interference{m_serv,k,n} = grad_sense;
+            else
+                % 如果没有有效的功率分解，设置零梯度
+                power_gradients.signal{m_serv,k,n} = zeros(Na, 1);
+                power_gradients.comm_interference{m_serv,k,n} = zeros(Na, 1);
+                power_gradients.sense_interference{m_serv,k,n} = zeros(Na, 1);
             end
         end
     end
 end
 
-%% 辅助函数：计算功率项梯度
-function grad = compute_power_gradient(h, W, u, q_traj, H, k, n, Na, kappa)
-    % 计算 ∇_t |w^H h(t)|^2 的梯度
+%% 辅助函数：统一功率梯度计算（基于矩阵形式）
+function grad = compute_power_gradient_unified(h, W, u, q_traj, H, k, n, Na, kappa)
+    % 计算 ∇_t trace(W * h(t) * h(t)^H) 的梯度
+    % 使用矩阵形式确保与calculate_master_rate_function完全一致
     grad = zeros(Na, 1);
-    
-    % 提取波束向量（使用主特征向量）
-    [V, D] = eig(W);
-    [~, idx] = max(diag(D));
-    w = V(:,idx) * sqrt(max(D(idx,idx), 0));
     
     % 计算位置相关参数
     qk_2d = squeeze(q_traj(k, :, n));
@@ -488,16 +464,16 @@ function grad = compute_power_gradient(h, W, u, q_traj, H, k, n, Na, kappa)
     
     dist_3d = sqrt(dx^2 + dy^2 + H_k^2);
     cos_theta = H_k / dist_3d;
-    
-    % 计算梯度：∇|w^H h(t)|^2 = 2*Re(conj(w^H h) * w^H ∇h)
-    wHh = w' * h;
     phi = 2*pi * cos_theta;
     
+    % 计算梯度：∇ trace(W * h * h^H) = 2 * Re(trace(W * (∇h) * h^H))
     for l = 1:Na
-        % ∇h 的第l个元素
-        dh_dtl = 1j * phi * h(l);
-        % 梯度的第l个分量
-        grad(l) = 2 * real(conj(wHh) * w(l)' * dh_dtl);
+        % ∇h/∇t_l 是一个向量，第l个元素是 1j*phi*h(l)，其他为0
+        dh_dt = zeros(Na, 1);
+        dh_dt(l) = 1j * phi * h(l);
+        
+        % 梯度公式：2 * Re(trace(W * (∇h * h^H)))
+        grad(l) = 2 * real(trace(W * (dh_dt * h')));
     end
 end
 
