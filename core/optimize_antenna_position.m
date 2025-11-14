@@ -1,7 +1,7 @@
 function [t_opt, obj_history] = optimize_antenna_position(...
     q_traj, alpha_mkn, W_mkn, R_mkn, ...
     u, v, H, H_sense, M, K, N, Na, Q, t_init, t_all_fixed, t_start, t_end, d_min, ...
-    kappa, Pmax, Gamma, sigma2)
+    kappa, Pmax, Gamma, sigma2, h_mkn_precomputed)
 % OPTIMIZE_ANTENNA_POSITION - 天线位置优化（两步SCA方法）
 %
 % 说明：
@@ -54,15 +54,22 @@ function [t_opt, obj_history] = optimize_antenna_position(...
     for sca_iter = 1:max_sca_iter
         % 步骤1: 计算当前目标值
         % 计算当前真实和速率 - 使用唯一真理函数
-        % 步骤1: 预计算当前位置的信道矩阵（统一计算，避免重复）
-        h_mkn_current = cell(M, K, N);
-        for m = 1:M
-            for k = 1:K
-                for n = 1:N
-                    if m == 1
-                        h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_old, Na);
-                    else
-                        h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_all_fixed{m}, Na);
+        % 步骤1: 使用与Step 5完全相同的预计算信道矩阵
+        % 重要：确保与ULA基准使用相同的信道数据，保证数学一致性
+        if sca_iter == 1
+            % 第一次迭代：使用传入的预计算信道（与Step 5一致）
+            h_mkn_current = h_mkn_precomputed;
+        else
+            % 后续迭代：基于更新的位置重新计算信道
+            h_mkn_current = cell(M, K, N);
+            for m = 1:M
+                for k = 1:K
+                    for n = 1:N
+                        if m == 1
+                            h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_old, Na);
+                        else
+                            h_mkn_current{m,k,n} = get_channel(m, k, n, u, q_traj, H, kappa, t_all_fixed{m}, Na);
+                        end
                     end
                 end
             end
